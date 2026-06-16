@@ -57,7 +57,7 @@ requires-dist = [
     { name = "onnxscript", specifier = ">=0.7.0" },
     { name = "onnxsim", specifier = ">=0.4.36" },
     { name = "pandas", specifier = ">=3.0.0" },
-    { name = "pillow", specifier = ">=12.1.1" },
+    { name = "pillow", specifier = ">=10.0.0" },
     { name = "psutil", specifier = ">=7.2.2" },
     { name = "pylint", specifier = ">=2.3.0" },
     { name = "pytest", specifier = ">=8.0" },
