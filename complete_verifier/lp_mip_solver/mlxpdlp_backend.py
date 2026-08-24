@@ -303,6 +303,13 @@ def solve_mlxpdlp(lp: LPProblem, device: str = "cpu", tol: float = 1e-4,
                 print(f"mlxPDLP: prescaled {work_lp.num_variables} variables "
                       "(bound-range ratio > 1e6)")
 
+    # The public warm-start contract uses original-model coordinates. Apply
+    # the inverse of the variable prescaling before constructing the solver;
+    # row duals are unchanged, while reduced costs scale like the objective.
+    solver_warm_start = warm_start
+    if mapping is not None and warm_start is not None:
+        solver_warm_start = map_warm_start_to_scaled(warm_start, mapping)
+
     solver = mlxpdlp.Solver(
         num_variables=work_lp.num_variables,
         num_constraints=work_lp.num_constraints,
@@ -316,9 +323,12 @@ def solve_mlxpdlp(lp: LPProblem, device: str = "cpu", tol: float = 1e-4,
         objective=work_lp.objective,
         objective_constant=work_lp.objective_constant,
         parameters=parameters,
-        primal_start=warm_start.get("primal") if warm_start else None,
-        dual_start=warm_start.get("dual") if warm_start else None,
-        reduced_cost_start=warm_start.get("reduced_cost") if warm_start else None,
+        primal_start=(solver_warm_start.get("primal")
+                      if solver_warm_start else None),
+        dual_start=(solver_warm_start.get("dual")
+                    if solver_warm_start else None),
+        reduced_cost_start=(solver_warm_start.get("reduced_cost")
+                            if solver_warm_start else None),
         device=device,
     )
     res = solver.solve()
@@ -485,8 +495,8 @@ def primal_violation(lp: LPProblem, result) -> float:
 #     competitive with HiGHS at medium+, solves large where HiGHS gives
 #     nothing in 120s).
 #   * tol 1e-7 on CPU is a trap (300s TIME_LIMIT while already converged).
-#   * Warm starts do not pay off for per-neuron objectives; they remain
-#     available for the per-subdomain pattern (same objective, new bounds).
+#   * Warm starts do not pay off when per-neuron objectives change. The
+#     same-objective Metal -> CPU fallback does reuse Metal's final iterate.
 #   * Primal solutions from Metal violate constraints by ~1e-4..5e-3
 #     (absolute 0.01..0.4 at large) - counterexamples need a feasibility
 #     check before they may declare "unsafe".
@@ -587,6 +597,44 @@ class CertifiedSolve:
     @property
     def infeasible(self) -> bool:
         return self.status == STATUS_INFEASIBLE
+
+
+def _extract_metal_warm_start(csolve: CertifiedSolve,
+                              lp: LPProblem) -> Optional[Dict]:
+    """Return a validated original-coordinate warm start from a Metal solve.
+
+    ``_solve_one`` normalizes both min/max objectives before calling mlxPDLP,
+    so these primal/dual iterates already correspond to the exact objective
+    the CPU fallback will solve. Results from a prescaled solve are mapped
+    back to original coordinates by ``solve_mlxpdlp`` first.
+    """
+    if csolve.device not in ("gpu", "metal"):
+        return None
+    result = csolve.raw.get("result") if csolve.raw else None
+    if result is None:
+        return None
+    values = (
+        getattr(result, "primal_solution", None),
+        getattr(result, "dual_solution", None),
+    )
+    if any(value is None for value in values):
+        return None
+    try:
+        primal, dual = (
+            np.asarray(value, dtype=np.float64).reshape(-1).copy()
+            for value in values
+        )
+    except (TypeError, ValueError):
+        return None
+    if (primal.size != lp.num_variables or
+            dual.size != lp.num_constraints):
+        return None
+    if not (np.all(np.isfinite(primal)) and np.all(np.isfinite(dual))):
+        return None
+    return {
+        "primal": primal,
+        "dual": dual,
+    }
 
 
 def _solve_one(lp: LPProblem, device: str, tol: float, time_limit: float,
@@ -834,6 +882,11 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
     if decisive(best):
         return best
 
+    # Copy Metal's final iterate only when escalation is actually required.
+    # A same-objective CPU fallback can continue from it; other fallback
+    # engines keep their existing cold-start behavior.
+    metal_warm_start = _extract_metal_warm_start(best, lp)
+
     for fb in ladder():
         remaining = remaining_time()
         if remaining is not None and remaining <= 0.0:
@@ -842,10 +895,33 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
             if isinstance(fb, tuple) and fb[0] == "cpu":
                 _, fb_tol = fb
                 params = make_parameters(tol=fb_tol, time_limit=remaining,
+                                         presolve=metal_warm_start is None,
                                          ruiz_iterations=ruiz_iterations,
                                          restart_policy=restart_policy)
-                cs = _solve_one(lp, "cpu", fb_tol, remaining, sense,
-                                parameters=params, prescale=prescale)
+                try:
+                    cs = _solve_one(lp, "cpu", fb_tol, remaining, sense,
+                                    warm_start=metal_warm_start,
+                                    parameters=params, prescale=prescale)
+                    if metal_warm_start is not None:
+                        cs.raw["warm_started_from"] = "gpu"
+                except Exception:
+                    # A transferred iterate must never disable the existing
+                    # certified CPU fallback. Retry cold when validation in
+                    # the native solver rejects a seemingly usable start.
+                    if metal_warm_start is None:
+                        raise
+                    cold_remaining = remaining_time()
+                    if cold_remaining is not None and cold_remaining <= 0.0:
+                        raise
+                    cold_params = make_parameters(
+                        tol=fb_tol, time_limit=cold_remaining, presolve=True,
+                        ruiz_iterations=ruiz_iterations,
+                        restart_policy=restart_policy)
+                    cs = _solve_one(
+                        lp, "cpu", fb_tol, cold_remaining, sense,
+                        warm_start=None, parameters=cold_params,
+                        prescale=prescale)
+                    cs.raw["warm_start_retry"] = "cold"
             elif isinstance(fb, tuple) and fb[0] == "gurobi":
                 cs = solve_gurobi_lp(lp, time_limit=remaining, sense=sense)
             elif isinstance(fb, tuple) and fb[0] == "highs":
@@ -1460,6 +1536,25 @@ def map_scaled_result_to_original(lp, result2, mapping):
         dual_objective_value=float(result2.dual_objective_value),
     )
     return proxy
+
+
+def map_warm_start_to_scaled(warm_start, mapping):
+    """Map an original-coordinate warm start into a prescaled LP.
+
+    For ``x = lb + d*x'``, row duals are unchanged and stationarity gives
+    ``z' = d*z`` for reduced costs.
+    """
+    lb_shift, d = mapping
+    d = np.asarray(d, dtype=np.float64)
+    scaled = {
+        "primal": ((np.asarray(warm_start["primal"], dtype=np.float64) -
+                    np.asarray(lb_shift, dtype=np.float64)) / d),
+        "dual": np.asarray(warm_start["dual"], dtype=np.float64).copy(),
+    }
+    if warm_start.get("reduced_cost") is not None:
+        scaled["reduced_cost"] = (
+            d * np.asarray(warm_start["reduced_cost"], dtype=np.float64))
+    return scaled
 
 
 def scipy_spdiag(v):

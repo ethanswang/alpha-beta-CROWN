@@ -396,6 +396,142 @@ def test_ladder_uses_one_total_time_budget(monkeypatch):
     assert 0.0 < seen[0] < 0.095
 
 
+def test_warm_start_mapping_round_trip():
+    mapping = (
+        np.array([2.0, 0.0]),
+        np.array([10.0, 1.0]),
+    )
+    original = {
+        "primal": np.array([7.0, 3.0]),
+        "dual": np.array([4.0]),
+        "reduced_cost": np.array([5.0, 6.0]),
+    }
+
+    scaled = _backend.map_warm_start_to_scaled(original, mapping)
+    np.testing.assert_allclose(scaled["primal"], [0.5, 3.0])
+    np.testing.assert_allclose(scaled["dual"], [4.0])
+    np.testing.assert_allclose(scaled["reduced_cost"], [50.0, 6.0])
+
+    scaled_result = types.SimpleNamespace(
+        primal_solution=scaled["primal"],
+        dual_solution=scaled["dual"],
+        reduced_cost=scaled["reduced_cost"],
+        dual_objective_value=0.0,
+    )
+    restored = _backend.map_scaled_result_to_original(
+        tiny_lp(), scaled_result, mapping)
+    np.testing.assert_allclose(restored.primal_solution, original["primal"])
+    np.testing.assert_allclose(restored.dual_solution, original["dual"])
+    np.testing.assert_allclose(restored.reduced_cost,
+                               original["reduced_cost"])
+
+
+@pytest.mark.parametrize("sense", ["min", "max"])
+def test_cpu_fallback_warm_starts_from_metal(monkeypatch, sense):
+    iterate = types.SimpleNamespace(
+        primal_solution=np.array([0.25, 0.75]),
+        dual_solution=np.array([-1.0]),
+        reduced_cost=np.array([0.5, -0.5]),
+    )
+    metal = _fake_certified(status=_backend.STATUS_TIME_LIMIT, bound=0.0,
+                            bound_ok=True, device="gpu")
+    metal.raw = {"result": iterate}
+    cpu_bound = 20.0 if sense == "min" else -20.0
+    cpu = _fake_certified(status=_backend.STATUS_OPTIMAL, bound=cpu_bound,
+                          bound_ok=True, device="cpu")
+    calls = []
+
+    def fake_solve(*args, **kwargs):
+        calls.append((args, kwargs))
+        return metal if len(calls) == 1 else cpu
+
+    monkeypatch.setattr(_backend, "_solve_one", fake_solve)
+    result = _backend.solve_certified(
+        tiny_lp(), device="gpu", sense=sense, margin=10.0, threshold=0.0,
+        fallback=["cpu"])
+
+    assert result is cpu
+    assert len(calls) == 2
+    cpu_kwargs = calls[1][1]
+    np.testing.assert_allclose(cpu_kwargs["warm_start"]["primal"],
+                               iterate.primal_solution)
+    np.testing.assert_allclose(cpu_kwargs["warm_start"]["dual"],
+                               iterate.dual_solution)
+    assert "reduced_cost" not in cpu_kwargs["warm_start"]
+    assert cpu_kwargs["parameters"].presolve is False
+
+
+def test_cpu_fallback_stays_cold_without_complete_metal_iterate(monkeypatch):
+    incomplete = types.SimpleNamespace(
+        primal_solution=np.array([0.25, 0.75]),
+        dual_solution=None,
+        reduced_cost=np.array([0.5, -0.5]),
+    )
+    metal = _fake_certified(status=_backend.STATUS_TIME_LIMIT, bound=0.0,
+                            bound_ok=True, device="gpu")
+    metal.raw = {"result": incomplete}
+    cpu = _fake_certified(status=_backend.STATUS_OPTIMAL, bound=20.0,
+                          bound_ok=True, device="cpu")
+    calls = []
+
+    def fake_solve(*args, **kwargs):
+        calls.append((args, kwargs))
+        return metal if len(calls) == 1 else cpu
+
+    monkeypatch.setattr(_backend, "_solve_one", fake_solve)
+    result = _backend.solve_certified(
+        tiny_lp(), device="gpu", margin=10.0, threshold=0.0,
+        fallback=["cpu"])
+
+    assert result is cpu
+    assert calls[1][1]["warm_start"] is None
+    assert calls[1][1]["parameters"].presolve is True
+
+
+def test_cpu_fallback_retries_cold_when_warm_start_is_rejected(monkeypatch):
+    iterate = types.SimpleNamespace(
+        primal_solution=np.array([0.25, 0.75]),
+        dual_solution=np.array([-1.0]),
+    )
+    metal = _fake_certified(status=_backend.STATUS_TIME_LIMIT, bound=0.0,
+                            bound_ok=True, device="gpu")
+    metal.raw = {"result": iterate}
+    cpu = _fake_certified(status=_backend.STATUS_OPTIMAL, bound=20.0,
+                          bound_ok=True, device="cpu")
+    calls = []
+
+    def fake_solve(*args, **kwargs):
+        calls.append((args, kwargs))
+        if len(calls) == 1:
+            return metal
+        if len(calls) == 2:
+            raise ValueError("rejected warm start")
+        return cpu
+
+    monkeypatch.setattr(_backend, "_solve_one", fake_solve)
+    result = _backend.solve_certified(
+        tiny_lp(), device="gpu", margin=10.0, threshold=0.0,
+        fallback=["cpu"])
+
+    assert result is cpu
+    assert len(calls) == 3
+    assert calls[2][1]["warm_start"] is None
+    assert calls[2][1]["parameters"].presolve is True
+    assert result.raw["warm_start_retry"] == "cold"
+
+
+def test_metal_to_cpu_warm_start_end_to_end():
+    if not mlxpdlp.has_gpu():
+        pytest.skip("no Metal device")
+    result = _backend.solve_certified(
+        tiny_lp(), device="gpu", tol=1e-4, time_limit=5.0,
+        margin=50.0, threshold=0.0, fallback=["cpu"])
+    assert result.device == "cpu"
+    assert result.raw["warm_started_from"] == "gpu"
+    assert result.status == _backend.STATUS_OPTIMAL
+    assert result.bound <= -1.0 + 1e-6
+
+
 def test_expired_total_budget_does_not_start_solver(monkeypatch):
     def should_not_run(*args, **kwargs):
         raise AssertionError("solver started after its deadline")

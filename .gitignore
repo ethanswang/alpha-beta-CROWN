@@ -26,3 +26,5 @@ release_abcrown
 cachier
 out.csv
 results.csv
+/.codegraph/
+/docs/
