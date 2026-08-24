@@ -35,6 +35,15 @@ from auto_LiRPA.bound_ops import BoundConv, BoundLinear, BoundBatchNormalization
 from utils import get_reduce_op, get_batch_size_from_masks
 import torch.nn as nn
 
+# mlxPDLP backend (Apple Silicon LP acceleration). Only used when
+# arguments.Config["solver"]["mip"]["lp_backend"] == "mlxpdlp"; the
+# default backend remains gurobi.
+from .mlxpdlp_backend import (
+    mlxpdlp_enabled, get_lp_backend_settings, make_fallback_from_settings,
+    solve_gurobi_model_with_mlxpdlp, STATUS_OPTIMAL, STATUS_INFEASIBLE,
+    STATUS_TIME_LIMIT, STATUS_USER_OBJ_LIMIT, metal_polish_enabled,
+)
+
 
 def handle_gurobi_error(message):
     print(f'Gurobi error: {message}')
@@ -124,6 +133,19 @@ def FSB_score(model, results, branching_reduceop='min'):
 multiprocess_mip_model = None
 stop_multiprocess = False
 mip_solve_time_start = 0
+
+
+def _remaining_mip_time(configured_limit):
+    """Return the remaining shared MIP/BaB budget for one backend call."""
+    limit = float(configured_limit)
+    try:
+        total = float(arguments.Config["bab"]["timeout"])
+        if mip_solve_time_start:
+            total = max(0.0, total - (time.time() - mip_solve_time_start))
+        limit = min(limit, total)
+    except Exception:
+        pass
+    return max(0.0, limit)
 
 # Concurrency helpers and MIP attack worker
 
@@ -331,6 +353,52 @@ def mip_solver_lb_ub(candidate, init=None, save_adv=None, mip_skip_unsafe=False)
             raise NotImplementedError
 
     mip_model.setObjective(v, grb.GRB.MINIMIZE)
+    if mlxpdlp_enabled():
+        settings = get_lp_backend_settings()
+        remaining = _remaining_mip_time(settings["time_limit"])
+        if remaining <= 0.0:
+            return vlb, vub, STATUS_TIME_LIMIT, adv
+        try:
+            r = solve_gurobi_model_with_mlxpdlp(
+                mip_model, objective_var=v, sense="min",
+                device=settings["device"], tol=settings["tol"],
+                time_limit=remaining,
+                margin=settings["margin"], threshold=0.0,
+                fallback=make_fallback_from_settings(settings),
+                ruiz_iterations=settings["ruiz_iterations"],
+                restart_policy=settings["restart_policy"],
+                host_polish=metal_polish_enabled(settings))
+        except ValueError as e:
+            raise RuntimeError(
+                "mlxPDLP backend cannot solve MIP models; use "
+                "--mip_formulation lp or lp_integer together with "
+                "--mip_lp_backend mlxpdlp") from e
+        if r.status == STATUS_INFEASIBLE:
+            raise RuntimeError("mlxPDLP: refinement LP infeasible (should not happen)")
+        if r.certified:
+            vlb = max(r.objbound, out_lb)  # certified LB on min v: sound
+        if r.solcount and r.objval is not None:
+            vub = min(r.objval, out_ub)  # feasible primal value
+        result_status = r.status
+        if vub < 0:
+            # An adversarial example is found
+            if not mip_skip_unsafe:
+                stop_multiprocess = True
+            if save_adv and r.solcount:
+                adv = [r.x.get(var_name) for var_name in save_adv]
+            if r.solcount and r.status != STATUS_OPTIMAL:
+                # Gurobi uses USER_OBJ_LIMIT when a feasible incumbent proves
+                # the objective cutoff before optimality. Preserve that
+                # distinction instead of misreporting OPTIMAL.
+                result_status = STATUS_USER_OBJ_LIMIT
+        print("solving LP (mlxPDLP device={}) for {}, status:{}, [{}, {}]=>[{}, {}], time: {:.3g}s, audit={:.1e}, term={}, objbound={:.4g}".format(
+            r.device, v.VarName, r.status, out_lb, out_ub, vlb, vub, r.solve_time,
+            r.audit_gap, r.termination, r.objbound))
+        sys.stdout.flush()
+        if time.time() - mip_solve_time_start > arguments.Config["bab"]["timeout"]:
+            stop_multiprocess = True
+        return vlb, vub, result_status, adv
+
     if init_lb is not None:
         init_x_start(mip_model, init_lb)
     try:
@@ -371,6 +439,43 @@ def mip_solver_lb_ub_and(candidate, save_adv=None, rhs=None):
         model.addConstr(vi <= rhs[i])
 
     model.setObjective(0, grb.GRB.MINIMIZE)
+
+    if mlxpdlp_enabled():
+        settings = get_lp_backend_settings()
+        remaining = _remaining_mip_time(settings["time_limit"])
+        if remaining <= 0.0:
+            return None, None, STATUS_TIME_LIMIT, adv
+        try:
+            r = solve_gurobi_model_with_mlxpdlp(
+                model, objective_var=None, sense="min",
+                device=settings["device"], tol=settings["tol"],
+                time_limit=remaining,
+                fallback=make_fallback_from_settings(settings),
+                ruiz_iterations=settings["ruiz_iterations"],
+                restart_policy=settings["restart_policy"],
+                host_polish=metal_polish_enabled(settings))
+        except ValueError as e:
+            raise RuntimeError(
+                "mlxPDLP backend cannot solve MIP models; use "
+                "--mip_formulation lp or lp_integer together with "
+                "--mip_lp_backend mlxpdlp") from e
+        if r.status == STATUS_INFEASIBLE:
+            print("No feasible solution found (mlxPDLP)")
+            result_status = STATUS_INFEASIBLE
+        elif r.solcount:
+            if save_adv:
+                adv = [r.x.get(var_name) for var_name in save_adv]
+            print("Feasible solution found (mlxPDLP)")
+            # This call is a feasibility problem. A checked feasible primal is
+            # sufficient even if optimization stopped early.
+            result_status = STATUS_OPTIMAL
+        else:
+            print(f"mlxPDLP AND-mode solve undecided: {r.termination}")
+            result_status = STATUS_TIME_LIMIT
+        print("solving LP (mlxPDLP device={}) time: {:.3g}s".format(
+            r.device, r.solve_time))
+        sys.stdout.flush()
+        return None, None, result_status, adv
 
     model.optimize()
     if model.Status == grb.GRB.OPTIMAL:

@@ -34,6 +34,15 @@ from utils import get_reduce_op, get_batch_size_from_masks
 import torch.nn as nn
 from typing import TYPE_CHECKING
 
+# mlxPDLP backend (Apple Silicon LP acceleration). The default backend is
+# gurobi; these helpers are only used when
+# arguments.Config["solver"]["mip"]["lp_backend"] == "mlxpdlp".
+from .mlxpdlp_backend import (
+    mlxpdlp_enabled, get_lp_backend_settings, make_fallback_from_settings,
+    solve_gurobi_model_with_mlxpdlp, STATUS_OPTIMAL, STATUS_INFEASIBLE,
+    metal_polish_enabled,
+)
+
 if TYPE_CHECKING:
     from beta_CROWN_solver import LiRPANet
 
@@ -54,6 +63,41 @@ def lp_solver(candidate):
         return out_lb, out_ub, time.time() - refine_time, refined
     if solver_utils.stop_multiprocess:
         return out_lb, out_ub, time.time() - refine_time, refined
+
+    if mlxpdlp_enabled():
+        settings = get_lp_backend_settings()
+        kwargs = dict(
+            device=settings["device"], tol=settings["tol"],
+            time_limit=settings["time_limit"],
+            fallback=make_fallback_from_settings(settings),
+            ruiz_iterations=settings["ruiz_iterations"],
+            restart_policy=settings["restart_policy"],
+            host_polish=metal_polish_enabled(settings))
+        vlb, vub = out_lb, out_ub
+        # Minimize to tighten lower bound (certified).
+        r = solve_gurobi_model_with_mlxpdlp(
+            model, objective_var=v, sense="min", **kwargs)
+        if r.certified:
+            vlb, refined = max(vlb, r.objbound), True
+        else:
+            print(f"Warning: mlxPDLP LP solve not certified (min phase): {r.termination}")
+        # Maximize to tighten upper bound (certified).
+        r = solve_gurobi_model_with_mlxpdlp(
+            model, objective_var=v, sense="max", **kwargs)
+        if r.certified:
+            vub, refined = min(vub, r.objbound), True
+        else:
+            print(f"Warning: mlxPDLP LP solve not certified (max phase): {r.termination}")
+        duration = time.time() - refine_time
+        print_str = (
+            f"Linear {v.VarName}: old_lb={out_lb:.7g}, new_lb={vlb:.7g}, "
+            f"old_ub={out_ub:.7g}, new_ub={vub:.7g}, "
+            f"lb_diff={vlb - out_lb:.7g}, ub_diff={out_ub - vub:.7g}, "
+            f"time={duration:3g} (mlxPDLP)"
+        )
+        print(print_str)
+        sys.stdout.flush()
+        return vlb, vub, print_str, refined
 
     # Minimize to tighten lower bound.
     model.setObjective(v, grb.GRB.MINIMIZE)
@@ -136,9 +180,33 @@ def build_the_model_lp(
 
     out_vars = m.net[optimized_layer_name].solver_vars
     glbs = []
+    last_backend_result = None
     for obj in out_vars:
         model_sense = grb.GRB.MAXIMIZE if compute_upper_bound else grb.GRB.MINIMIZE
         m.net.solver_model.setObjective(obj, model_sense)
+        if mlxpdlp_enabled():
+            settings = get_lp_backend_settings()
+            r = solve_gurobi_model_with_mlxpdlp(
+                m.net.solver_model, objective_var=obj,
+                sense="max" if compute_upper_bound else "min",
+                device=settings["device"], tol=settings["tol"],
+                time_limit=settings["time_limit"],
+                fallback=make_fallback_from_settings(settings),
+                ruiz_iterations=settings["ruiz_iterations"],
+                restart_policy=settings["restart_policy"],
+                host_polish=metal_polish_enabled(settings))
+            last_backend_result = r
+            if r.status == STATUS_INFEASIBLE:
+                glb = float("inf") if compute_upper_bound else -float("inf")
+            elif r.certified:
+                # Certified bound (lower for min, upper for max): sound.
+                glb = r.objbound
+            else:
+                raise RuntimeError(
+                    f"mlxPDLP backend undecided for {obj.VarName}: "
+                    f"{r.termination}; run with --mip_lp_backend gurobi")
+            glbs.append(glb)
+            continue
         try:
             m.net.solver_model.optimize()
         except grb.GurobiError as e:
@@ -153,6 +221,21 @@ def build_the_model_lp(
         glbs.append(glb)
 
     if get_primals:
+        if mlxpdlp_enabled():
+            if last_backend_result is None or not last_backend_result.solcount:
+                raise RuntimeError(
+                    "mlxPDLP did not return a feasible primal for get_primals")
+
+            def solver_value(var):
+                name = var.VarName
+                if name not in last_backend_result.x:
+                    raise RuntimeError(
+                        f"mlxPDLP primal is missing variable {name!r}")
+                return last_backend_result.x[name]
+        else:
+            def solver_value(var):
+                return var.X
+
         # Extract primal values layer by layer.
         primal_vars = []
         layers = [m.net.final_node()]
@@ -165,21 +248,23 @@ def build_the_model_lp(
             vars_ = layer.solver_vars
             pv = []
             if not isinstance(vars_[0], list):
-                pv.extend(var.X for var in vars_)
+                pv.extend(solver_value(var) for var in vars_)
             else:
                 for chan in range(len(vars_)):
                     for row in range(len(vars_[chan])):
                         for col in range(len(vars_[chan][row])):
-                            pv.append(vars_[chan][row][col].X)
+                            pv.append(solver_value(vars_[chan][row][col]))
             primal_vars.append(pv)
 
         if using_integer:
             integer_vars = []
             for relu_layer in m.net.relus:
-                integer_vars.append([relu_integer.X for relu_integer in relu_layer.integer_vars])
+                integer_vars.append([
+                    solver_value(relu_integer)
+                    for relu_integer in relu_layer.integer_vars])
 
         input_primal_gurobi = primal_vars[0]
-        print("### Extracted primal values from Gurobi LP model ###")
+        print("### Extracted primal values from solver LP model ###")
         _ = input_primal_gurobi  # Preserve legacy side effect
         # The original implementation kept these variables for potential debugging.
         # m.solve_diving_lp(primal_vars, integer_vars, lower_bounds, upper_bounds)
@@ -376,6 +461,52 @@ def all_node_split_LP(arg):
         objVar = all_node_model.getVarByName(orig_out_vars[out_idx])
         decision_threshold = rhs[out_idx]
 
+        if mlxpdlp_enabled():
+            settings = get_lp_backend_settings()
+            r = solve_gurobi_model_with_mlxpdlp(
+                all_node_model, objective_var=objVar, sense="min",
+                device=settings["device"], tol=settings["tol"],
+                time_limit=settings["time_limit"],
+                margin=settings["margin"], threshold=decision_threshold,
+                fallback=make_fallback_from_settings(settings),
+                ruiz_iterations=settings["ruiz_iterations"],
+                restart_policy=settings["restart_policy"],
+                host_polish=metal_polish_enabled(settings))
+            counterexample = None
+            if r.status == STATUS_INFEASIBLE:
+                glb = float('inf')
+            elif r.certified:
+                glb = r.objbound  # certified lower bound: sound
+            else:
+                del all_node_model
+                print(f"mlxPDLP: domain {dix} LP undecided ({r.termination}); "
+                      "leaving bounds unchanged")
+                return 'unknown', dix, float('inf'), None
+            if glb > decision_threshold:
+                lp_status = "safe"
+            else:
+                # A certified bound below the threshold does not by itself
+                # produce a counterexample; require a feasible primal.
+                if not r.solcount or termination_flag_lp.value == 1:
+                    del all_node_model
+                    return 'unknown', dix, float(glb), None
+
+                def extract_value(name):
+                    if isinstance(name, list):
+                        out = [extract_value(n) for n in name]
+                        return None if any(o is None for o in out) else out
+                    return r.x.get(name)
+
+                counterexample = extract_value(input_name)
+                if counterexample is None:
+                    del all_node_model
+                    return 'unknown', dix, float(glb), None
+                lp_status = 'unsafe'
+                print(f'Verified to be unsafe with input counterexample {counterexample}')
+                termination_flag_lp.value = 1
+            del all_node_model
+            return lp_status, dix, float(glb), counterexample
+
         all_node_model.setObjective(objVar, grb.GRB.MINIMIZE)
         all_node_model.update()
         try:
@@ -454,15 +585,27 @@ def batch_verification_all_node_split_LP(
     if len(all_node_model_para_list) == 0:
         return False
 
-    # Use map to enable multiprocessing
-    with multiprocessing.Pool(mip_multi_proc) as pool:
-        solver_result = pool.map(all_node_split_LP, all_node_model_para_list)
+    # Use map to enable multiprocessing. The worker relies on
+    # process-global model/flag variables, which macOS spawn does not
+    # inherit; solve sequentially when the mlxPDLP backend is active
+    # (matches the single-process paths elsewhere).
+    if mlxpdlp_enabled():
+        solver_result = [all_node_split_LP(arg) for arg in all_node_model_para_list]
+    else:
+        with multiprocessing.Pool(mip_multi_proc) as pool:
+            solver_result = pool.map(all_node_split_LP, all_node_model_para_list)
 
     # Save the counterexample in stats if unsafe, otherwise adjust bounds to exclude safe cases
     for (lp_status, domain_idx, dlb, counterexample) in solver_result:
         if lp_status == "unsafe":
             stats.counterexample = torch.tensor([counterexample])
             return True
+        if lp_status == "unknown":
+            # The LP backend could not decide this domain (e.g. no certified
+            # bound and no feasible counterexample). Updating the bound with
+            # +inf here would claim safety unsoundly, so leave it unchanged.
+            print(f"mlxPDLP: domain {domain_idx} undecided; keeping bounds")
+            continue
         dom_lb_all[-1][domain_idx] = torch.tensor([dlb])
         dom_lb[domain_idx] = torch.tensor([dlb])
     return False
@@ -601,6 +744,30 @@ def update_the_model_cut(m, cut, pre_lbs=None, pre_ubs=None, split=None, verbose
 
     guro_start = time.time()
     objVar = m.model_cut.getVarByName(orig_out_vars[0].VarName)
+
+    if mlxpdlp_enabled():
+        settings = get_lp_backend_settings()
+        r = solve_gurobi_model_with_mlxpdlp(
+            m.model_cut, objective_var=objVar, sense="min",
+            device=settings["device"], tol=settings["tol"],
+            time_limit=settings["time_limit"],
+            fallback=make_fallback_from_settings(settings),
+            ruiz_iterations=settings["ruiz_iterations"],
+            restart_policy=settings["restart_policy"],
+            host_polish=metal_polish_enabled(settings))
+        if r.status == STATUS_INFEASIBLE:
+            print("warning, mlxPDLP cut LP infeasible!")
+            glb = float('inf')
+        elif r.certified:
+            glb = r.objbound  # certified lower bound: sound
+        else:
+            print(f"mlxPDLP cut LP undecided: {r.termination}")
+            print("model status not supported!")
+            exit()
+        print("#### cut mlxPDLP glb:", glb)
+        print(f"cut mlxPDLP device={r.device} time={r.solve_time:.3g}s")
+        del m.model_cut
+        return glb
 
     m.model_cut.setObjective(objVar, grb.GRB.MINIMIZE)
     m.model_cut.update()

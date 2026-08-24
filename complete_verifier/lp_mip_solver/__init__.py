@@ -42,6 +42,7 @@ from .bounds_core import (
     check_lp_cut, update_the_model_cut, build_the_model_lp, lp_solver, solve_diving_lp
 )
 from .refine_core import build_the_model_mip_refine, _intermediate_PGD_attack
+from .mlxpdlp_backend import mlxpdlp_enabled
 from auto_LiRPA.utils import stop_criterion_min
 # Constants for backward compatibility
 CPLEX_FOLDER = os.path.join(os.path.dirname(os.path.dirname(__file__)), "cuts/CPLEX_cuts")
@@ -200,7 +201,11 @@ def mip(model, ret_incomplete, vnnlib_handler, labels_to_verify=None,
                                                                     arguments.Config["attack"]["cex_path"], "unsafe-mip")
                         return verified_status, ret
                 # Lower bound < 0 and upper bound > 0, must be a timeout.
-                assert mip_status[pidx] == 9 or mip_status[pidx] == -1, "should only be timeout for label pidx"
+                # With the mlxPDLP backend, status 2 (OPTIMAL) is also
+                # possible here: its certified bound is a valid lower
+                # bound and the primal objective a valid upper bound, so
+                # an optimal-but-not-tight solve lands in this branch too.
+                assert mip_status[pidx] in (2, 9, -1), "should only be timeout for label pidx"
                 verified_status = "unknown-mip"
             print(f"verified {verified_status} with OR-style specification!")
             return verified_status, ret
@@ -445,8 +450,15 @@ def build_the_model_mip_or(m, labels_to_verify=None, save_mps=False, process_dic
     else:
         candidates = [(name, None, input_names, mip_skip_unsafe) for name in candidates]
 
-    with multiprocessing.Pool(mip_multi_proc) as pool:
-        solver_result = pool.starmap(mip_solver_lb_ub, candidates, chunksize=1)
+    # NOTE: multiprocessing with the shared gurobi model requires fork
+    # start-method globals, which macOS spawn does not inherit. Solve
+    # sequentially when the mlxPDLP backend is active (matches the
+    # single-process path in mip_core.py).
+    if mlxpdlp_enabled():
+        solver_result = [mip_solver_lb_ub(*candidate) for candidate in candidates]
+    else:
+        with multiprocessing.Pool(mip_multi_proc) as pool:
+            solver_result = pool.starmap(mip_solver_lb_ub, candidates, chunksize=1)
 
     multiprocess_mip_model = None
     stop_multiprocess = False

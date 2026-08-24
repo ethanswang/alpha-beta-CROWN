@@ -509,6 +509,57 @@ class ConfigHandler:
         self.add_argument('--mip_add_output_cut', action='store_true',
                           help="Get the output <= 0 as a cut from the last layer.",
                           hierarchy=h + ["output_cut"])
+        self.add_argument('--mip_lp_backend', type=str, default='gurobi',
+                          help='LP backend for LP relaxations (all-node-split LP, LP/'
+                               'lp_integer refinement, LP bound refinement, cut LP). '
+                               '"mlxpdlp" uses the mlxPDLP PDHG solver on Apple MLX '
+                               '(Metal FP32 or CPU FP64) with certified bounds and an '
+                               'escalation ladder; "gurobi" (default) keeps the current '
+                               'behavior.',
+                          choices=["gurobi", "mlxpdlp"], hierarchy=h + ["lp_backend"])
+        self.add_argument('--mip_mlxpdlp_device', type=str, default='metal',
+                          help='MLXPDLP device for --mip_lp_backend mlxpdlp: "metal" '
+                               '(FP32 GPU, fast, ~1e-3..6e-3 relative certified-bound '
+                               'looseness) or "cpu" (FP64, certified).',
+                          choices=["metal", "cpu"], hierarchy=h + ["mlxpdlp_device"])
+        self.add_argument('--mip_mlxpdlp_tolerance', type=float, default=1e-4,
+                          help='MLXPDLP optimality/feasibility tolerance (1e-4 is the '
+                               'Metal FP32 floor; 1e-5 recommended for the CPU device).',
+                          hierarchy=h + ["mlxpdlp_tolerance"])
+        self.add_argument('--mip_mlxpdlp_margin', type=float, default=1e-3,
+                          help='Decision margin for mlxPDLP certified bounds: when the '
+                               'certified bound does not prove the decision with this '
+                               'margin, the solve escalates to the fallback backend.',
+                          hierarchy=h + ["mlxpdlp_margin"])
+        self.add_argument('--mip_mlxpdlp_fallback', type=str, default='gurobi',
+                          help='MLXPDLP escalation fallback: "gurobi" (default; '
+                               'the bundled restricted license caps models at '
+                               '~2000 vars), "cpu" (mlxPDLP FP64 at tolerance '
+                               '1e-6), "highs" (scipy HiGHS, license-free '
+                               'reference), or "none".',
+                          choices=["gurobi", "cpu", "highs", "none"],
+                          hierarchy=h + ["mlxpdlp_fallback"])
+        self.add_argument('--mip_mlxpdlp_ruiz', type=int, default=0,
+                          help='MLXPDLP L-infinity Ruiz equilibration iterations '
+                               '(0 disables it; Phase 3: ruiz=0 is ~2.2x faster '
+                               'on network LP relaxations than the 10 default).',
+                          hierarchy=h + ["mlxpdlp_ruiz"])
+        self.add_argument('--mip_mlxpdlp_restart_policy', type=int, default=0,
+                          choices=[0, 1, 2],
+                          help='MLXPDLP primal-weight restart policy: 0 = '
+                               'cuPDLPx PID (default), 1 = HPR-LP-style sigma '
+                               'update, 2 = frozen-weight diagnostic.',
+                          hierarchy=h + ["mlxpdlp_restart_policy"])
+        self.add_argument('--mip_mlxpdlp_polish', type=str, default='auto',
+                          choices=['off', 'on', 'auto'],
+                          help='MLXPDLP opt-in 1e-5 Metal accuracy: bounded '
+                               'host-FP64 correction after the FP32 Metal '
+                               'iterations (mlxPDLP >= 2026-08-23). "auto" '
+                               'enables it on Metal when the tolerance is at '
+                               'most 1e-5. Portable Metal accuracy stays 1e-4; '
+                               'the 1e-5 target holds for well-conditioned '
+                               'LPs.',
+                          hierarchy=h + ["mlxpdlp_polish"])
 
         h = ["bab"]
         self.add_argument("--max_domains", type=int, default=float("inf"),

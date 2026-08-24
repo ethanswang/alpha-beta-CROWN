@@ -343,3 +343,70 @@ The team acknowledges the financial and advisory support (2021 - 2023) from Prof
 
 Our library is released under the BSD 3-Clause license. A copy of the license is included [here](LICENSE).
 
+
+## mlxPDLP LP backend (Apple Silicon acceleration, experimental)
+
+The LP relaxation solves in BaB/MIP verification (all-node-split LP,
+per-neuron LP refinement, cut LP) can run on [mlxPDLP](https://github.com/mlxPDLP/mlxPDLP),
+a PDHG LP solver on Apple MLX (Metal FP32 GPU / CPU FP64), instead of
+Gurobi. Gurobi remains the default and is still required as the MODEL
+BUILDER (the verifier keeps constructing its LP relaxations in gurobipy;
+only the solve engine is swapped). gurobipy 13+ ships a restricted
+non-production license sufficient for model building and for solving
+small (<~2000 var) LPs.
+
+Install (into the verifier environment):
+
+```sh
+pip install /path/to/mlxPDLP/python \
+  -Ccmake.define.MLX_BUILD_DIR=/path/to/mlx/build \
+  -Ccmake.define.MLXPDLP_ALLOW_DOWNLOADS=ON
+```
+
+Run recipe:
+
+```sh
+python abcrown.py --config <your.yaml> \
+  --mip_lp_backend mlxpdlp \
+  --mip_mlxpdlp_device metal \
+  --mip_mlxpdlp_fallback highs \
+  --mip_formulation lp_integer   # for the per-neuron LP refinement path
+```
+
+Config flags (`solver.mip`, defaults in brackets):
+
+* `--mip_lp_backend [gurobi|mlxpdlp]` - LP solve engine.
+* `--mip_mlxpdlp_device [metal|cpu]` - FP32 Metal (fast) or FP64 CPU.
+* `--mip_mlxpdlp_tolerance [1e-4]` - solver tolerance. Portable Metal
+  accuracy is 1e-4; with `--mip_mlxpdlp_polish auto` (default) Metal
+  reaches an audited 1e-5 on well-conditioned LPs (mlxPDLP >=
+  2026-08-23). 1e-6 remains the certified CPU-stage setting.
+* `--mip_mlxpdlp_polish [auto|on|off]` - opt-in 1e-5 Metal accuracy
+  (bounded host-FP64 correction after the FP32 iterations).
+* `--mip_mlxpdlp_margin [1e-3]` - decision margin: when the certified
+  bound does not prove the decision with this margin, the solve
+  escalates to the fallback.
+* `--mip_mlxpdlp_fallback [gurobi|cpu|highs|none]` - escalation target:
+  gurobi (exact; restricted license limited to ~2000 vars), cpu
+  (mlxPDLP FP64 @1e-6), highs (scipy HiGHS, license-free exact).
+* `--mip_mlxpdlp_ruiz [0]` - Ruiz equilibration iterations (0 = off;
+  ~2.2x faster on network LPs).
+* `--mip_mlxpdlp_restart_policy [0]` - PDHG restart policy 0/1/2.
+
+Soundness contract: the backend NEVER returns raw PDHG objectives as
+certified bounds. Every result is re-audited on the original model in
+host FP64 (`audit_certificate`: stationarity `||c - A'y - z||` plus a
+rigorous `safe_lb = dual_obj - ||c - A'y - z||_inf * R` correction).
+Status OPTIMAL(2) is only reported when the certificate passes; "safe"
+verdicts only come from certified bounds (with margin); "unsafe"
+verdicts require a primal witness feasible on the original model.
+Undecided domains return a new "unknown" status and are NOT pruned.
+Sizes: for certified bounds use an exact solver up to ~2k vars, the
+Metal->HiGHS ladder up to ~30k vars, and Metal->CPU@1e-6 above (see
+`complete_verifier/lp_mip_solver/mlxpdlp_backend.py: recommend_solve_plan`
+and `docs/mlxpdlp_integration_plan.md`).
+
+Known limitations: macOS spawn multiprocessing is bypassed for the
+backend paths (sequential solves); warm starts require
+`presolve=False`; Metal primals can violate constraints by ~1e-4..5e-3
+relative (counterexamples are feasibility-checked before use).
