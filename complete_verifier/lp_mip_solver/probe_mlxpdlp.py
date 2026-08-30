@@ -290,18 +290,22 @@ def objective_on_variable(lp, var_index, maximize=False):
 # ---------------------------------------------------------------------------
 
 def run_case(name, lp, device, tol, presolve=True, warm_start=None,
-             time_limit=3600.0, iter_limit=0, host_polish=False):
+             time_limit=3600.0, iter_limit=0, host_polish=False,
+             geometric_mean_iterations=12):
     parameters = None
     if host_polish or iter_limit > 0:
         parameters = make_parameters(tol=tol, time_limit=time_limit,
                                      presolve=presolve,
-                                     iteration_limit=iter_limit)
+                                     iteration_limit=iter_limit,
+                                     geometric_mean_iterations=(
+                                         geometric_mean_iterations))
         if host_polish:
             parameters.host_double_polishing = True
             parameters.host_double_early_handoff = True
     out = solve_mlxpdlp(lp, device=device, tol=tol, presolve=presolve,
                         time_limit=time_limit, warm_start=warm_start,
-                        parameters=parameters)
+                        parameters=parameters,
+                        geometric_mean_iterations=geometric_mean_iterations)
     res = out["result"]
     out["case"] = name
     out["device"] = device
@@ -336,11 +340,14 @@ def main():
                          "(checks whether Metal can pass the 1e-6 cert audit)")
     ap.add_argument("--iter-limit", type=int, default=0,
                     help="additional per-solve iteration cap (0 = unlimited)")
+    ap.add_argument("--geometric-mean-iterations", type=int, default=12,
+                    help="Tomlin geometric-mean scaling passes (0 disables)")
     args = ap.parse_args()
 
     import mlxpdlp
     print(f"mlxPDLP {mlxpdlp.version()}  has_gpu={mlxpdlp.has_gpu()}")
     print(f"CPU tol {args.cpu_tol} (FP64), Metal tol {args.metal_tol} (FP32 floor ~1e-4)")
+    print(f"Geometric-mean scaling passes: {args.geometric_mean_iterations}")
 
     results = []
 
@@ -392,6 +399,8 @@ def main():
             try:
                 r = run_case(name, lp, device, tol, time_limit=args.time_limit,
                              iter_limit=args.iter_limit,
+                             geometric_mean_iterations=(
+                                 args.geometric_mean_iterations),
                              host_polish=(args.metal_polish and device == "gpu"))
                 gap = (None if h["objective"] is None or r["objective"] is None
                        else abs(r["objective"] - h["objective"]) / max(1.0, abs(h["objective"])))
@@ -426,7 +435,9 @@ def main():
             lp_k = objective_on_variable(lp, vi, maximize=True)
             # presolve must be off to allow warm starts
             r = solve_mlxpdlp(lp_k, device="cpu", tol=args.cpu_tol,
-                              presolve=False, warm_start=prev)
+                              presolve=False, warm_start=prev,
+                              geometric_mean_iterations=(
+                                  args.geometric_mean_iterations))
             prev = {"primal": r["result"].primal_solution,
                     "dual": r["result"].dual_solution,
                     "reduced_cost": r["result"].reduced_cost}
@@ -441,7 +452,9 @@ def main():
             rows.append(r)
         # Cold-start comparison for the first neuron.
         r = solve_mlxpdlp(objective_on_variable(lp, targets[0], maximize=True),
-                          device="cpu", tol=args.cpu_tol, presolve=True)
+                          device="cpu", tol=args.cpu_tol, presolve=True,
+                          geometric_mean_iterations=(
+                              args.geometric_mean_iterations))
         print(f"  (cold, presolve on) neuron {targets[0]} (MAX): obj={fmt(-r['objective'],6)} "
               f"time={r['time_sec']:.3f}s iter={r['num_iter']} status={r['status']}")
         r["objective"] = -r["objective"]

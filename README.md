@@ -355,6 +355,9 @@ only the solve engine is swapped). gurobipy 13+ ships a restricted
 non-production license sufficient for model building and for solving
 small (<~2000 var) LPs.
 
+Use mlxPDLP from 2026-08-30 or newer; the integration exposes the
+geometric-mean preconditioner added on that date.
+
 Install (into the verifier environment):
 
 ```sh
@@ -389,6 +392,9 @@ Config flags (`solver.mip`, defaults in brackets):
 * `--mip_mlxpdlp_fallback [gurobi|cpu|highs|none]` - escalation target:
   gurobi (exact; restricted license limited to ~2000 vars), cpu
   (mlxPDLP FP64 @1e-6), highs (scipy HiGHS, license-free exact).
+* `--mip_mlxpdlp_geometric_mean [12]` - Tomlin geometric-mean matrix
+  scaling passes (the mlxPDLP default; 0 disables it; requires mlxPDLP
+  >= 2026-08-30).
 * `--mip_mlxpdlp_ruiz [0]` - Ruiz equilibration iterations (0 = off;
   ~2.2x faster on network LPs).
 * `--mip_mlxpdlp_restart_policy [0]` - PDHG restart policy 0/1/2.

@@ -365,6 +365,8 @@ def mip_solver_lb_ub(candidate, init=None, save_adv=None, mip_skip_unsafe=False)
                 time_limit=remaining,
                 margin=settings["margin"], threshold=0.0,
                 fallback=make_fallback_from_settings(settings),
+                geometric_mean_iterations=settings.get(
+                    "geometric_mean_iterations", 12),
                 ruiz_iterations=settings["ruiz_iterations"],
                 restart_policy=settings["restart_policy"],
                 host_polish=metal_polish_enabled(settings))
@@ -451,6 +453,8 @@ def mip_solver_lb_ub_and(candidate, save_adv=None, rhs=None):
                 device=settings["device"], tol=settings["tol"],
                 time_limit=remaining,
                 fallback=make_fallback_from_settings(settings),
+                geometric_mean_iterations=settings.get(
+                    "geometric_mean_iterations", 12),
                 ruiz_iterations=settings["ruiz_iterations"],
                 restart_policy=settings["restart_policy"],
                 host_polish=metal_polish_enabled(settings))

@@ -539,6 +539,11 @@ class ConfigHandler:
                                'reference), or "none".',
                           choices=["gurobi", "cpu", "highs", "none"],
                           hierarchy=h + ["mlxpdlp_fallback"])
+        self.add_argument('--mip_mlxpdlp_geometric_mean', type=int, default=12,
+                          help='MLXPDLP Tomlin geometric-mean matrix scaling '
+                               'passes (12 is the upstream default; 0 disables '
+                               'it; requires mlxPDLP >= 2026-08-30).',
+                          hierarchy=h + ["mlxpdlp_geometric_mean"])
         self.add_argument('--mip_mlxpdlp_ruiz', type=int, default=0,
                           help='MLXPDLP L-infinity Ruiz equilibration iterations '
                                '(0 disables it; Phase 3: ruiz=0 is ~2.2x faster '

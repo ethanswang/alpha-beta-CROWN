@@ -901,7 +901,10 @@ def test_prescale_soundness_random_mixed_scale():
 
 
 def test_make_parameters_tuning_knobs():
-    p = _backend.make_parameters(tol=1e-5, ruiz_iterations=0, restart_policy=1)
+    p = _backend.make_parameters(
+        tol=1e-5, geometric_mean_iterations=3,
+        ruiz_iterations=0, restart_policy=1)
+    assert p.geometric_mean_iterations == 3
     assert p.l_inf_ruiz_iterations == 0
     assert p.restart_policy == 1
 
@@ -910,7 +913,9 @@ def test_settings_knob_defaults_and_config():
     import sys as _sys
     fake_args = _sys.modules.get("arguments")
     s = _backend.get_lp_backend_settings()
-    # defaults (no verifier config): ruiz=0 per Phase 3 finding
+    # Defaults: upstream geometric-mean scaling, with Ruiz disabled per the
+    # Phase-3 network-LP finding.
+    assert s["geometric_mean_iterations"] == 12
     assert s["ruiz_iterations"] == 0 and s["restart_policy"] == 0
 
 

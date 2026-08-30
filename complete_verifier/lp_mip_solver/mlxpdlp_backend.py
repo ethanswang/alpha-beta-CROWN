@@ -221,11 +221,15 @@ def gurobi_to_mlxpdlp(model, objective_vars=None, objective_coeffs=None) -> LPPr
 
 def make_parameters(tol: float = 1e-4, time_limit: float = 3600.0,
                     iteration_limit: int = 0, presolve: bool = True,
-                    verbose: bool = False, ruiz_iterations: Optional[int] = None,
+                    verbose: bool = False,
+                    geometric_mean_iterations: Optional[int] = None,
+                    ruiz_iterations: Optional[int] = None,
                     restart_policy: Optional[int] = None,
                     seed_defaults: bool = True):
     """Build mlxpdlp.Parameters with the requested optimality tolerance.
 
+    geometric_mean_iterations: Tomlin geometric-mean scaling passes (mlxPDLP
+    >= 2026-08-30; 12 is the upstream default).
     ruiz_iterations/restart_policy: Phase-3 tuning knobs (on network LPs,
     ruiz_iterations=0 is ~2.2x faster than the 10 default).
     """
@@ -237,6 +241,13 @@ def make_parameters(tol: float = 1e-4, time_limit: float = 3600.0,
     params.termination_criteria.eps_optimal_relative = tol
     params.termination_criteria.eps_feasible_relative = tol
     params.time_limit_seconds = time_limit
+    if geometric_mean_iterations is not None:
+        try:
+            params.geometric_mean_iterations = geometric_mean_iterations
+        except AttributeError as exc:
+            raise RuntimeError(
+                "geometric-mean scaling requires mlxPDLP >= 2026-08-30"
+            ) from exc
     if ruiz_iterations is not None:
         params.l_inf_ruiz_iterations = ruiz_iterations
     if restart_policy is not None:
@@ -250,6 +261,7 @@ def solve_mlxpdlp(lp: LPProblem, device: str = "cpu", tol: float = 1e-4,
                   time_limit: float = 3600.0, presolve: bool = True,
                   verbose: bool = False, warm_start: Optional[Dict] = None,
                   parameters=None, prescale: str = "auto",
+                  geometric_mean_iterations: Optional[int] = None,
                   ruiz_iterations: Optional[int] = None,
                   restart_policy: Optional[int] = None,
                   host_polish: bool = False) -> Dict:
@@ -277,6 +289,8 @@ def solve_mlxpdlp(lp: LPProblem, device: str = "cpu", tol: float = 1e-4,
     if parameters is None:
         parameters = make_parameters(tol=tol, time_limit=time_limit,
                                      presolve=presolve, verbose=verbose,
+                                     geometric_mean_iterations=(
+                                         geometric_mean_iterations),
                                      ruiz_iterations=ruiz_iterations,
                                      restart_policy=restart_policy)
     elif time_limit is not None:
@@ -640,6 +654,7 @@ def _extract_metal_warm_start(csolve: CertifiedSolve,
 def _solve_one(lp: LPProblem, device: str, tol: float, time_limit: float,
                sense: str, warm_start=None, parameters=None,
                iteration_limit: int = 0, prescale: str = "auto",
+               geometric_mean_iterations: Optional[int] = None,
                ruiz_iterations: Optional[int] = None,
                restart_policy: Optional[int] = None,
                host_polish: bool = False) -> CertifiedSolve:
@@ -651,7 +666,9 @@ def _solve_one(lp: LPProblem, device: str, tol: float, time_limit: float,
         lp_work.objective_constant = -lp_work.objective_constant
     out = solve_mlxpdlp(lp_work, device=device, tol=tol, time_limit=time_limit,
                         warm_start=warm_start, parameters=parameters,
-                        prescale=prescale, ruiz_iterations=ruiz_iterations,
+                        prescale=prescale,
+                        geometric_mean_iterations=geometric_mean_iterations,
+                        ruiz_iterations=ruiz_iterations,
                         restart_policy=restart_policy, host_polish=host_polish)
     res = out["result"]
     # Re-audit on the exact objective/sense used for this stage.
@@ -786,6 +803,7 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
                     threshold: Optional[float] = None,
                     warm_start: Optional[Dict] = None,
                     fallback=None, parameters=None, prescale: str = "auto",
+                    geometric_mean_iterations: Optional[int] = None,
                     ruiz_iterations: Optional[int] = None,
                     restart_policy: Optional[int] = None,
                     host_polish: bool = False) -> CertifiedSolve:
@@ -809,6 +827,8 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
             a list of callables lp -> CertifiedSolve; a single callable;
             or the strings "cpu"/"gurobi" (default ladder for that entry).
         parameters: mlxpdlp.Parameters override for the FIRST stage.
+        geometric_mean_iterations: Tomlin scaling passes used by the initial
+            solve and mlxPDLP CPU fallbacks (12 is the upstream default).
 
     Returns CertifiedSolve. Callers must check .status and .bound_ok:
       STATUS_OPTIMAL(2)   -> the solver reached an audited optimum
@@ -862,7 +882,9 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
 
     best = _solve_one(lp, device, tol, time_limit, sense,
                       warm_start=warm_start, parameters=parameters,
-                      prescale=prescale, ruiz_iterations=ruiz_iterations,
+                      prescale=prescale,
+                      geometric_mean_iterations=geometric_mean_iterations,
+                      ruiz_iterations=ruiz_iterations,
                       restart_policy=restart_policy, host_polish=host_polish)
     results = [best]
 
@@ -896,6 +918,8 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
                 _, fb_tol = fb
                 params = make_parameters(tol=fb_tol, time_limit=remaining,
                                          presolve=metal_warm_start is None,
+                                         geometric_mean_iterations=(
+                                             geometric_mean_iterations),
                                          ruiz_iterations=ruiz_iterations,
                                          restart_policy=restart_policy)
                 try:
@@ -915,6 +939,7 @@ def solve_certified(lp: LPProblem, device: str = "gpu", tol: float = 1e-4,
                         raise
                     cold_params = make_parameters(
                         tol=fb_tol, time_limit=cold_remaining, presolve=True,
+                        geometric_mean_iterations=geometric_mean_iterations,
                         ruiz_iterations=ruiz_iterations,
                         restart_policy=restart_policy)
                     cs = _solve_one(
@@ -1052,6 +1077,7 @@ def solve_gurobi_model_with_mlxpdlp(model, objective_var=None, sense="min",
                                     margin=None, threshold=None,
                                     warm_start=None,
                                     fallback=None, prescale: str = "auto",
+                                    geometric_mean_iterations: Optional[int] = None,
                                     ruiz_iterations: Optional[int] = None,
                                     restart_policy: Optional[int] = None,
                                     host_polish: bool = False) -> GurobiLikeResult:
@@ -1064,8 +1090,9 @@ def solve_gurobi_model_with_mlxpdlp(model, objective_var=None, sense="min",
             (gurobi_to_mlxpdlp normalizes MAXIMIZE to minimization).
         sense: "min" (default) or "max" (only used with objective_var).
         device/tol/time_limit/margin/threshold: see solve_certified. The
-            default ladder (Metal -> CPU@1e-5 -> Gurobi) applies.
+            default ladder (Metal -> CPU@1e-6 -> Gurobi) applies.
         warm_start: optional dict, see solve_certified.
+        geometric_mean_iterations: see solve_certified.
 
     Returns GurobiLikeResult. Contracts the call sites rely on:
         * certified/objbound describe the audited dual bound independently of
@@ -1103,6 +1130,8 @@ def solve_gurobi_model_with_mlxpdlp(model, objective_var=None, sense="min",
                              sense=sense, margin=margin, threshold=threshold,
                              warm_start=warm_start, fallback=fallback,
                              prescale=prescale,
+                             geometric_mean_iterations=(
+                                 geometric_mean_iterations),
                              ruiz_iterations=ruiz_iterations,
                              restart_policy=restart_policy,
                              host_polish=host_polish)
@@ -1114,6 +1143,8 @@ def solve_gurobi_model_with_mlxpdlp(model, objective_var=None, sense="min",
                              sense="min", margin=margin, threshold=threshold,
                              warm_start=warm_start, fallback=fallback,
                              prescale=prescale,
+                             geometric_mean_iterations=(
+                                 geometric_mean_iterations),
                              ruiz_iterations=ruiz_iterations,
                              restart_policy=restart_policy,
                              host_polish=host_polish)
@@ -1173,6 +1204,7 @@ def get_lp_backend_settings():
         "margin": 1e-3,
         "fallback": "gurobi",
         "time_limit": 3600.0,
+        "geometric_mean_iterations": 12,
         "ruiz_iterations": 0,
         "restart_policy": 0,
         "metal_polish": "auto",
@@ -1185,6 +1217,8 @@ def get_lp_backend_settings():
         settings["tol"] = mip_cfg.get("mlxpdlp_tolerance", 1e-4)
         settings["margin"] = mip_cfg.get("mlxpdlp_margin", 1e-3)
         settings["fallback"] = mip_cfg.get("mlxpdlp_fallback", "gurobi")
+        settings["geometric_mean_iterations"] = mip_cfg.get(
+            "mlxpdlp_geometric_mean", 12)
         settings["ruiz_iterations"] = mip_cfg.get("mlxpdlp_ruiz", 0)
         settings["restart_policy"] = mip_cfg.get("mlxpdlp_restart_policy", 0)
         settings["metal_polish"] = mip_cfg.get("mlxpdlp_polish", "auto")

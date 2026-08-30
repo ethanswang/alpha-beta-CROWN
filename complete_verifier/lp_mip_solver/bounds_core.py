@@ -70,6 +70,8 @@ def lp_solver(candidate):
             device=settings["device"], tol=settings["tol"],
             time_limit=settings["time_limit"],
             fallback=make_fallback_from_settings(settings),
+            geometric_mean_iterations=settings.get(
+                "geometric_mean_iterations", 12),
             ruiz_iterations=settings["ruiz_iterations"],
             restart_policy=settings["restart_policy"],
             host_polish=metal_polish_enabled(settings))
@@ -192,6 +194,8 @@ def build_the_model_lp(
                 device=settings["device"], tol=settings["tol"],
                 time_limit=settings["time_limit"],
                 fallback=make_fallback_from_settings(settings),
+                geometric_mean_iterations=settings.get(
+                    "geometric_mean_iterations", 12),
                 ruiz_iterations=settings["ruiz_iterations"],
                 restart_policy=settings["restart_policy"],
                 host_polish=metal_polish_enabled(settings))
@@ -469,6 +473,8 @@ def all_node_split_LP(arg):
                 time_limit=settings["time_limit"],
                 margin=settings["margin"], threshold=decision_threshold,
                 fallback=make_fallback_from_settings(settings),
+                geometric_mean_iterations=settings.get(
+                    "geometric_mean_iterations", 12),
                 ruiz_iterations=settings["ruiz_iterations"],
                 restart_policy=settings["restart_policy"],
                 host_polish=metal_polish_enabled(settings))
@@ -752,6 +758,8 @@ def update_the_model_cut(m, cut, pre_lbs=None, pre_ubs=None, split=None, verbose
             device=settings["device"], tol=settings["tol"],
             time_limit=settings["time_limit"],
             fallback=make_fallback_from_settings(settings),
+            geometric_mean_iterations=settings.get(
+                "geometric_mean_iterations", 12),
             ruiz_iterations=settings["ruiz_iterations"],
             restart_policy=settings["restart_policy"],
             host_polish=metal_polish_enabled(settings))

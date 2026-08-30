@@ -305,7 +305,8 @@ GurobiLikeResult = _BACKEND.GurobiLikeResult
 SETTINGS_CPU = {
     "backend": "mlxpdlp", "device": "cpu", "tol": 1e-5,
     "margin": 1e-3, "fallback": None, "time_limit": 120.0,
-    "ruiz_iterations": 0, "restart_policy": 0,
+    "geometric_mean_iterations": 12, "ruiz_iterations": 0,
+    "restart_policy": 0,
 }
 
 
@@ -677,7 +678,8 @@ class TestSettings:
             "solver": {"mip": {
                 "lp_backend": "mlxpdlp", "mlxpdlp_device": "metal",
                 "mlxpdlp_tolerance": 1e-4, "mlxpdlp_margin": 1e-2,
-                "mlxpdlp_fallback": "cpu"}},
+                "mlxpdlp_fallback": "cpu",
+                "mlxpdlp_geometric_mean": 4}},
             "bab": {"timeout": 100.0},
         }
         monkeypatch.setitem(sys.modules, "arguments", fake_args)
@@ -687,5 +689,6 @@ class TestSettings:
         assert s["tol"] == 1e-4
         assert s["margin"] == 1e-2
         assert s["fallback"] == ["cpu"]
+        assert s["geometric_mean_iterations"] == 4
         assert s["time_limit"] == 100.0
         assert _BACKEND.mlxpdlp_enabled() is True
